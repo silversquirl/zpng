@@ -7,7 +7,7 @@ fn debug(comptime level: @TypeOf(.x), comptime format: []const u8, args: anytype
     }
 }
 
-const Image = struct {
+pub const Image = struct {
     width: u32,
     height: u32,
     pixels: [][4]u16,
