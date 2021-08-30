@@ -31,6 +31,11 @@ const Image = struct {
     pub fn y(self: Image, index: usize) u32 {
         return @intCast(u32, index / self.height);
     }
+
+    /// Return the pixel at the given X and Y coordinates
+    pub fn pix(self: Image, px: u32, py: u32) [4]u16 {
+        return self.pixels[px + py * self.width];
+    }
 };
 
 fn Decoder(comptime Reader: type) type {
