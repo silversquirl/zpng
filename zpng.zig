@@ -211,14 +211,14 @@ fn readPixels(allocator: *std.mem.Allocator, ihdr: Ihdr, data: []const u8) ![][4
             return error.InvalidPng;
         };
         try datar.readNoEof(line);
-        filterScanline(filter, ihdr.bit_depth, prev_line, line);
+        filterScanline(filter, ihdr.bit_depth, components, prev_line, line);
 
         var line_stream = std.io.fixedBufferStream(line);
         var bits = std.io.bitReader(.Big, line_stream.reader());
 
         var x: u32 = 0;
         while (x < ihdr.width) : (x += 1) {
-            pixels[y * ihdr.width + x] = switch (ihdr.colour_type) {
+            pixels[x + y * ihdr.width] = switch (ihdr.colour_type) {
                 .greyscale => blk: {
                     const v = ccoef * try bits.readBitsNoEof(u16, ihdr.bit_depth);
                     break :blk [4]u16{ v, v, v, std.math.maxInt(u16) };
@@ -246,7 +246,14 @@ fn readPixels(allocator: *std.mem.Allocator, ihdr: Ihdr, data: []const u8) ![][4
             };
         }
 
+        std.debug.assert(line_stream.pos == line_stream.buffer.len);
+
         std.mem.swap([]u8, &line, &prev_line);
+    }
+
+    var buf: [1]u8 = undefined;
+    if (0 != try datar.readAll(&buf)) {
+        return error.InvalidPng; // Excess IDAT data
     }
 
     return pixels;
@@ -319,13 +326,13 @@ fn chunkName(ctype: ChunkType) [4]u8 {
 }
 
 // TODO: use optional prev_line, so we can avoid zeroing
-fn filterScanline(filter: FilterType, bit_depth: u5, prev_line: []const u8, line: []u8) void {
+fn filterScanline(filter: FilterType, bit_depth: u5, components: u4, prev_line: []const u8, line: []u8) void {
     if (filter == .none) return;
 
-    const byte_rewind: u3 = switch (bit_depth) {
+    const byte_rewind = switch (bit_depth) {
         1, 2, 4 => 1,
-        8 => 3,
-        16 => 6,
+        8 => components,
+        16 => components * 2,
         else => unreachable,
     };
 
