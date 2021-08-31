@@ -56,28 +56,55 @@ fn Decoder(comptime Reader: type) type {
                 error.InvalidEnumTag => error.InvalidPng,
                 else => |e| e,
             };
-            // TODO: indexed colour
-            if (ihdr.colour_type == .indexed_colour) {
-                return error.UnsupportedPng;
-            }
             // TODO: interlacing
             if (ihdr.interlace_method != .none) {
                 return error.UnsupportedPng;
             }
 
             // Read data chunks
-            var data = std.ArrayList(u8).init(self.allocator);
-            defer data.deinit();
+            var data: ?std.ArrayList(u8) = null;
+            defer if (data) |l| l.deinit();
+            var palette: ?[]const [3]u8 = null;
+            defer if (palette) |p| self.allocator.free(p);
+
             while (true) {
                 const chunk = try self.readChunk();
-                defer self.allocator.free(chunk.data);
+                var free = true;
+                defer if (free) self.allocator.free(chunk.data);
+
                 switch (chunk.ctype) {
-                    .iend => break,
+                    .ihdr => return error.InvalidPng, // Duplicate IHDR
+                    .iend => {
+                        if (chunk.data.len != 0) {
+                            return error.InvalidPng; // Non-empty IEND
+                        }
+                        break;
+                    },
 
-                    // TODO: don't copy first idat
-                    .idat => try data.appendSlice(chunk.data),
+                    .plte => {
+                        if (ihdr.colour_type != .indexed) {
+                            return error.InvalidPng; // Unexpected PLTE
+                        }
+                        if (palette != null) {
+                            return error.InvalidPng; // Duplicate PLTE
+                        }
+                        if (chunk.data.len % 3 != 0) {
+                            return error.InvalidPng; // PLTE length not a multiple of three
+                        }
 
-                    else => {
+                        palette = std.mem.bytesAsSlice([3]u8, chunk.data);
+                        free = false;
+                    },
+
+                    // TODO: streaming
+                    .idat => if (data) |*l| {
+                        try l.appendSlice(chunk.data);
+                    } else {
+                        data = std.ArrayList(u8).fromOwnedSlice(self.allocator, chunk.data);
+                        free = false;
+                    },
+
+                    _ => {
                         const cname = chunkName(chunk.ctype);
                         debug(.warn, "Unsupported chunk: {s}", .{cname});
                         if (cname[0] & 32 == 0) {
@@ -89,7 +116,10 @@ fn Decoder(comptime Reader: type) type {
             }
 
             // Read pixel data
-            const pixels = try readPixels(self.allocator, ihdr, data.items);
+            if (data == null) {
+                return error.InvalidPng; // Missing IDAT
+            }
+            const pixels = try readPixels(self.allocator, ihdr, palette, data.?.items);
 
             return Image{
                 .width = ihdr.width,
@@ -121,7 +151,7 @@ fn Decoder(comptime Reader: type) type {
             const allowed_bit_depths: []const u5 = switch (colour_type) {
                 .greyscale => &.{ 1, 2, 4, 8, 16 },
                 .truecolour, .greyscale_alpha, .truecolour_alpha => &.{ 8, 16 },
-                .indexed_colour => &.{ 1, 2, 4, 8 },
+                .indexed => &.{ 1, 2, 4, 8 },
             };
             for (allowed_bit_depths) |depth| {
                 if (depth == bit_depth) break;
@@ -174,7 +204,12 @@ fn Decoder(comptime Reader: type) type {
     };
 }
 
-fn readPixels(allocator: *std.mem.Allocator, ihdr: Ihdr, data: []const u8) ![][4]u16 {
+fn readPixels(
+    allocator: *std.mem.Allocator,
+    ihdr: Ihdr,
+    palette: ?[]const [3]u8,
+    data: []const u8,
+) ![][4]u16 {
     var compressed_stream = std.io.fixedBufferStream(data);
     var data_stream = try std.compress.zlib.zlibStream(allocator, compressed_stream.reader());
     defer data_stream.deinit();
@@ -185,7 +220,7 @@ fn readPixels(allocator: *std.mem.Allocator, ihdr: Ihdr, data: []const u8) ![][4
     errdefer allocator.free(pixels);
 
     const components: u3 = switch (ihdr.colour_type) {
-        .indexed_colour => 1,
+        .indexed => 1,
         .greyscale => 1,
         .greyscale_alpha => 2,
         .truecolour => 3,
@@ -200,10 +235,18 @@ fn readPixels(allocator: *std.mem.Allocator, ihdr: Ihdr, data: []const u8) ![][4
     std.mem.set(u8, prev_line, 0); // Zero prev_line
 
     // Component coefficient - multiply by this to produce a normalized u16
-    const ccoef = @divExact(
-        std.math.maxInt(u16), // Max 16-bit value
-        @intCast(u16, (@as(u17, 1) << ihdr.bit_depth) - 1), // Max bit_depth-bit value
-    );
+    const ccoef = switch (ihdr.colour_type) {
+        .indexed => blk: {
+            if (palette == null) {
+                return error.InvalidPng; // Missing PLTE
+            }
+            break :blk 257;
+        },
+        else => @divExact(
+            std.math.maxInt(u16), // Max 16-bit value
+            @intCast(u16, (@as(u17, 1) << ihdr.bit_depth) - 1), // Max bit_depth-bit value
+        ),
+    };
 
     var y: u32 = 0;
     while (y < ihdr.height) : (y += 1) {
@@ -242,7 +285,15 @@ fn readPixels(allocator: *std.mem.Allocator, ihdr: Ihdr, data: []const u8) ![][4
                     ccoef * try bits.readBitsNoEof(u16, ihdr.bit_depth),
                 },
 
-                .indexed_colour => unreachable, // TODO
+                .indexed => blk: {
+                    const c = palette.?[try bits.readBitsNoEof(u8, ihdr.bit_depth)];
+                    break :blk .{
+                        ccoef * c[0],
+                        ccoef * c[1],
+                        ccoef * c[2],
+                        std.math.maxInt(u16),
+                    };
+                },
             };
         }
 
@@ -271,7 +322,7 @@ const Ihdr = struct {
 const ColourType = enum(u8) {
     greyscale = 0,
     truecolour = 2,
-    indexed_colour = 3,
+    indexed = 3,
     greyscale_alpha = 4,
     truecolour_alpha = 6,
 };
@@ -289,7 +340,7 @@ const FilterType = enum(u8) {
 
 const Chunk = struct {
     ctype: ChunkType,
-    data: []const u8,
+    data: []u8,
 };
 const ChunkType = blk: {
     const types = [_]*const [4]u8{
