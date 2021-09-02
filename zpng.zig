@@ -64,8 +64,9 @@ fn Decoder(comptime Reader: type) type {
             // Read data chunks
             var data: ?std.ArrayList(u8) = null;
             defer if (data) |l| l.deinit();
-            var palette: ?[]const [3]u8 = null;
+            var palette: ?[][4]u16 = null;
             defer if (palette) |p| self.allocator.free(p);
+            var transparent_color: ?[3]u16 = null; // Not normalized. If greyscale, only first value is used
 
             while (true) {
                 const chunk = try self.readChunk();
@@ -92,8 +93,15 @@ fn Decoder(comptime Reader: type) type {
                             return error.InvalidPng; // PLTE length not a multiple of three
                         }
 
-                        palette = std.mem.bytesAsSlice([3]u8, chunk.data);
-                        free = false;
+                        const rgb_palette = std.mem.bytesAsSlice([3]u8, chunk.data);
+                        const rgba_palette = try self.allocator.alloc([4]u16, rgb_palette.len);
+                        for (rgb_palette) |entry, i| {
+                            for (entry) |c, j| {
+                                rgba_palette[i][j] = @as(u16, 257) * c;
+                            }
+                            rgba_palette[i][3] = std.math.maxInt(u16);
+                        }
+                        palette = rgba_palette;
                     },
 
                     // TODO: streaming
@@ -102,6 +110,41 @@ fn Decoder(comptime Reader: type) type {
                     } else {
                         data = std.ArrayList(u8).fromOwnedSlice(self.allocator, chunk.data);
                         free = false;
+                    },
+
+                    .trns => {
+                        switch (ihdr.colour_type) {
+                            .greyscale_alpha, .truecolour_alpha => {
+                                return error.InvalidPng; // tRNS invalid with alpha channel
+                            },
+
+                            .greyscale => {
+                                if (chunk.data.len != 2) {
+                                    return error.InvalidPng; // tRNS data of incorrect length
+                                }
+                                transparent_color = .{ std.mem.readIntSliceBig(u16, chunk.data), 0, 0 };
+                            },
+
+                            .truecolour => {
+                                if (chunk.data.len != 6) {
+                                    return error.InvalidPng; // tRNS data of incorrect length
+                                }
+                                transparent_color = .{
+                                    std.mem.readIntSliceBig(u16, chunk.data),
+                                    std.mem.readIntSliceBig(u16, chunk.data[2..]),
+                                    std.mem.readIntSliceBig(u16, chunk.data[4..]),
+                                };
+                            },
+
+                            .indexed => {
+                                const plte = palette orelse {
+                                    return error.InvalidPng; // tRNS before PLTE
+                                };
+                                for (chunk.data) |trns, i| {
+                                    plte[i][3] = trns;
+                                }
+                            },
+                        }
                     },
 
                     _ => {
@@ -119,7 +162,13 @@ fn Decoder(comptime Reader: type) type {
             if (data == null) {
                 return error.InvalidPng; // Missing IDAT
             }
-            const pixels = try readPixels(self.allocator, ihdr, palette, data.?.items);
+            const pixels = try readPixels(
+                self.allocator,
+                ihdr,
+                palette orelse null, // ziglang/zig#4907
+                transparent_color,
+                data.?.items,
+            );
 
             return Image{
                 .width = ihdr.width,
@@ -207,7 +256,8 @@ fn Decoder(comptime Reader: type) type {
 fn readPixels(
     allocator: *std.mem.Allocator,
     ihdr: Ihdr,
-    palette: ?[]const [3]u8,
+    palette: ?[]const [4]u16,
+    transparent_color: ?[3]u16, // Not normalized. If greyscale, only first value is used
     data: []const u8,
 ) ![][4]u16 {
     var compressed_stream = std.io.fixedBufferStream(data);
@@ -234,19 +284,23 @@ fn readPixels(
     defer allocator.free(prev_line);
     std.mem.set(u8, prev_line, 0); // Zero prev_line
 
-    // Component coefficient - multiply by this to produce a normalized u16
-    const ccoef = switch (ihdr.colour_type) {
+    // Number of bits in actual colour components
+    const component_bits = switch (ihdr.colour_type) {
         .indexed => blk: {
             if (palette == null) {
                 return error.InvalidPng; // Missing PLTE
             }
-            break :blk 257;
+            break :blk 16;
         },
-        else => @divExact(
-            std.math.maxInt(u16), // Max 16-bit value
-            @intCast(u16, (@as(u17, 1) << ihdr.bit_depth) - 1), // Max bit_depth-bit value
-        ),
+        else => ihdr.bit_depth,
     };
+    // Max component_bits-bit value
+    const component_max = @intCast(u16, (@as(u17, 1) << component_bits) - 1);
+    // Multiply each colour component by this to produce a normalized u16
+    const component_coef = @divExact(
+        std.math.maxInt(u16),
+        component_max,
+    );
 
     var y: u32 = 0;
     while (y < ihdr.height) : (y += 1) {
@@ -261,40 +315,48 @@ fn readPixels(
 
         var x: u32 = 0;
         while (x < ihdr.width) : (x += 1) {
-            pixels[x + y * ihdr.width] = switch (ihdr.colour_type) {
+            var pix: [4]u16 = switch (ihdr.colour_type) {
                 .greyscale => blk: {
-                    const v = ccoef * try bits.readBitsNoEof(u16, ihdr.bit_depth);
-                    break :blk [4]u16{ v, v, v, std.math.maxInt(u16) };
+                    const v = try bits.readBitsNoEof(u16, ihdr.bit_depth);
+                    break :blk .{ v, v, v, component_max };
                 },
                 .greyscale_alpha => blk: {
-                    const v = ccoef * try bits.readBitsNoEof(u16, ihdr.bit_depth);
-                    const a = ccoef * try bits.readBitsNoEof(u16, ihdr.bit_depth);
-                    break :blk [4]u16{ v, v, v, a };
+                    const v = try bits.readBitsNoEof(u16, ihdr.bit_depth);
+                    const a = try bits.readBitsNoEof(u16, ihdr.bit_depth);
+                    break :blk .{ v, v, v, a };
                 },
 
                 .truecolour => .{
-                    ccoef * try bits.readBitsNoEof(u16, ihdr.bit_depth),
-                    ccoef * try bits.readBitsNoEof(u16, ihdr.bit_depth),
-                    ccoef * try bits.readBitsNoEof(u16, ihdr.bit_depth),
-                    std.math.maxInt(u16),
+                    try bits.readBitsNoEof(u16, ihdr.bit_depth),
+                    try bits.readBitsNoEof(u16, ihdr.bit_depth),
+                    try bits.readBitsNoEof(u16, ihdr.bit_depth),
+                    component_max,
                 },
                 .truecolour_alpha => .{
-                    ccoef * try bits.readBitsNoEof(u16, ihdr.bit_depth),
-                    ccoef * try bits.readBitsNoEof(u16, ihdr.bit_depth),
-                    ccoef * try bits.readBitsNoEof(u16, ihdr.bit_depth),
-                    ccoef * try bits.readBitsNoEof(u16, ihdr.bit_depth),
+                    try bits.readBitsNoEof(u16, ihdr.bit_depth),
+                    try bits.readBitsNoEof(u16, ihdr.bit_depth),
+                    try bits.readBitsNoEof(u16, ihdr.bit_depth),
+                    try bits.readBitsNoEof(u16, ihdr.bit_depth),
                 },
 
-                .indexed => blk: {
-                    const c = palette.?[try bits.readBitsNoEof(u8, ihdr.bit_depth)];
-                    break :blk .{
-                        ccoef * c[0],
-                        ccoef * c[1],
-                        ccoef * c[2],
-                        std.math.maxInt(u16),
-                    };
-                },
+                .indexed => palette.?[try bits.readBitsNoEof(u8, ihdr.bit_depth)],
             };
+
+            if (transparent_color) |trns| {
+                const n: u2 = switch (ihdr.colour_type) {
+                    .greyscale => 1,
+                    .truecolour => 3,
+                    else => unreachable,
+                };
+                if (std.mem.eql(u16, pix[0..n], &trns)) {
+                    pix[3] = 0;
+                }
+            }
+
+            const idx = x + y * ihdr.width;
+            for (pix) |c, i| {
+                pixels[idx][i] = component_coef * c;
+            }
         }
 
         std.debug.assert(line_stream.pos == line_stream.buffer.len);
@@ -348,6 +410,7 @@ const ChunkType = blk: {
         "PLTE",
         "IDAT",
         "IEND",
+        "tRNS",
     };
 
     var fields: [types.len]std.builtin.TypeInfo.EnumField = undefined;
@@ -414,8 +477,8 @@ fn paeth(a: u8, b: u8, c: u8) u8 {
         c;
 }
 
-test "read png" {
-    var dir = try std.fs.cwd().openDir("test", .{ .iterate = true });
+test "red/blue" {
+    var dir = try std.fs.cwd().openDir("test/red_blue", .{ .iterate = true });
     defer dir.close();
     var it = dir.iterate();
     while (try it.next()) |entry| {
@@ -429,6 +492,25 @@ test "read png" {
             const r: u16 = if (img.x(i) < 32) 0 else 65535;
             const b: u16 = if (img.y(i) < 32) 0 else 65535;
             try std.testing.expectEqual([4]u16{ r, 0, b, 65535 }, pix);
+        }
+    }
+}
+
+test "green/alpha" {
+    var dir = try std.fs.cwd().openDir("test/green_alpha", .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        const f = try dir.openFile(entry.name, .{});
+        defer f.close();
+        var buf = std.io.bufferedReader(f.reader());
+        const img = try Image.read(std.testing.allocator, buf.reader());
+        defer img.deinit(std.testing.allocator);
+
+        for (img.pixels) |pix, i| {
+            const g: u16 = if (img.x(i) < 32) 0 else 65535;
+            const a: u16 = if (img.y(i) < 32) 0 else 65535;
+            try std.testing.expectEqual([4]u16{ 0, g, 0, a }, pix);
         }
     }
 }
