@@ -1,6 +1,8 @@
 const std = @import("std");
 
-const debug_enabled = std.meta.globalOption("zpng_debug", bool) orelse (std.builtin.mode == .Debug);
+const debug_enabled = std.meta.globalOption("zpng_debug", bool) orelse
+    (@import("builtin").mode == .Debug);
+
 fn debug(comptime level: @TypeOf(.x), comptime format: []const u8, args: anytype) void {
     if (debug_enabled) {
         @field(std.log.scoped(.zpng), @tagName(level))(format, args);
@@ -14,12 +16,12 @@ pub const Image = struct {
 
     // If the PNG is invalid or corrupt, error.InvalidPng is returned.
     // If the PNG may be valid, but uses features not supported by this implementation, error.UnsupportedPng is returned.
-    pub fn read(allocator: *std.mem.Allocator, r: anytype) !Image {
+    pub fn read(allocator: std.mem.Allocator, r: anytype) !Image {
         var dec = Decoder(@TypeOf(r)){ .allocator = allocator, .r = r };
         return dec.decode();
     }
 
-    pub fn deinit(self: Image, allocator: *std.mem.Allocator) void {
+    pub fn deinit(self: Image, allocator: std.mem.Allocator) void {
         allocator.free(self.pixels);
     }
 
@@ -40,7 +42,7 @@ pub const Image = struct {
 
 fn Decoder(comptime Reader: type) type {
     return struct {
-        allocator: *std.mem.Allocator,
+        allocator: std.mem.Allocator,
         r: Reader,
 
         const Self = @This();
@@ -254,7 +256,7 @@ fn Decoder(comptime Reader: type) type {
 }
 
 fn readPixels(
-    allocator: *std.mem.Allocator,
+    allocator: std.mem.Allocator,
     ihdr: Ihdr,
     palette: ?[]const [4]u16,
     transparent_color: ?[3]u16, // Not normalized. If greyscale, only first value is used
