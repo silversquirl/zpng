@@ -13,6 +13,7 @@ pub const Image = struct {
     width: u32,
     height: u32,
     pixels: [][4]u16,
+    gamma: f32,
 
     // If the PNG is invalid or corrupt, error.InvalidPng is returned.
     // If the PNG may be valid, but uses features not supported by this implementation, error.UnsupportedPng is returned.
@@ -69,6 +70,7 @@ fn Decoder(comptime Reader: type) type {
             var palette: ?[][4]u16 = null;
             defer if (palette) |p| self.allocator.free(p);
             var transparent_color: ?[3]u16 = null; // Not normalized. If greyscale, only first value is used
+            var gamma: u32 = 1;
 
             while (true) {
                 const chunk = try self.readChunk();
@@ -149,6 +151,10 @@ fn Decoder(comptime Reader: type) type {
                         }
                     },
 
+                    .gama => {
+                        gamma = std.mem.readIntSliceBig(u32, chunk.data);
+                    },
+
                     _ => {
                         const cname = chunkName(chunk.ctype);
                         debug(.warn, "Unsupported chunk: {s}", .{cname});
@@ -176,6 +182,7 @@ fn Decoder(comptime Reader: type) type {
                 .width = ihdr.width,
                 .height = ihdr.height,
                 .pixels = pixels,
+                .gamma = @intToFloat(f32, gamma) / 100000.0
             };
         }
 
@@ -413,6 +420,7 @@ const ChunkType = blk: {
         "IDAT",
         "IEND",
         "tRNS",
+        "gAMA",
     };
 
     var fields: [types.len]std.builtin.TypeInfo.EnumField = undefined;
