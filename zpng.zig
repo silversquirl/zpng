@@ -415,7 +415,7 @@ const ChunkType = blk: {
         "tRNS",
     };
 
-    var fields: [types.len]std.builtin.TypeInfo.EnumField = undefined;
+    var fields: [types.len]std.builtin.Type.EnumField = undefined;
     for (types) |name, i| {
         var field_name: [4]u8 = undefined;
         fields[i] = .{
@@ -425,7 +425,6 @@ const ChunkType = blk: {
     }
 
     break :blk @Type(.{ .Enum = .{
-        .layout = .Auto,
         .tag_type = u32,
         .fields = &fields,
         .decls = &.{},
