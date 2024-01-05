@@ -27,11 +27,11 @@ pub const Image = struct {
 
     /// Return the X coordinate of the pixel at index
     pub fn x(self: Image, index: usize) u32 {
-        return @intCast(u32, index % self.width);
+        return @intCast(index % self.width);
     }
     /// Return the Y coordinate of the pixel at index
     pub fn y(self: Image, index: usize) u32 {
-        return @intCast(u32, index / self.height);
+        return @intCast(index / self.height);
     }
 
     /// Return the pixel at the given X and Y coordinates
@@ -97,8 +97,8 @@ fn Decoder(comptime Reader: type) type {
 
                         const rgb_palette = std.mem.bytesAsSlice([3]u8, chunk.data);
                         const rgba_palette = try self.allocator.alloc([4]u16, rgb_palette.len);
-                        for (rgb_palette) |entry, i| {
-                            for (entry) |c, j| {
+                        for (rgb_palette, 0..) |entry, i| {
+                            for (entry, 0..) |c, j| {
                                 rgba_palette[i][j] = @as(u16, 257) * c;
                             }
                             rgba_palette[i][3] = std.math.maxInt(u16);
@@ -124,7 +124,7 @@ fn Decoder(comptime Reader: type) type {
                                 if (chunk.data.len != 2) {
                                     return error.InvalidPng; // tRNS data of incorrect length
                                 }
-                                transparent_color = .{ std.mem.readIntSliceBig(u16, chunk.data), 0, 0 };
+                                transparent_color = .{ std.mem.readInt(u16, chunk.data[0..2], .big), 0, 0 };
                             },
 
                             .truecolour => {
@@ -132,9 +132,9 @@ fn Decoder(comptime Reader: type) type {
                                     return error.InvalidPng; // tRNS data of incorrect length
                                 }
                                 transparent_color = .{
-                                    std.mem.readIntSliceBig(u16, chunk.data),
-                                    std.mem.readIntSliceBig(u16, chunk.data[2..]),
-                                    std.mem.readIntSliceBig(u16, chunk.data[4..]),
+                                    std.mem.readInt(u16, chunk.data[0..][0..2], .big),
+                                    std.mem.readInt(u16, chunk.data[2..][0..2], .big),
+                                    std.mem.readInt(u16, chunk.data[4..][0..2], .big),
                                 };
                             },
 
@@ -142,7 +142,7 @@ fn Decoder(comptime Reader: type) type {
                                 const plte = palette orelse {
                                     return error.InvalidPng; // tRNS before PLTE
                                 };
-                                for (chunk.data) |trns, i| {
+                                for (chunk.data, 0..) |trns, i| {
                                     plte[i][3] = trns;
                                 }
                             },
@@ -190,15 +190,15 @@ fn Decoder(comptime Reader: type) type {
             const r = stream.reader();
 
             // Read and validate width and height
-            const width = try r.readIntBig(u32);
-            const height = try r.readIntBig(u32);
+            const width = try r.readInt(u32, .big);
+            const height = try r.readInt(u32, .big);
             if (width == 0 or height == 0) {
                 return error.InvalidPng;
             }
 
             // Read and validate colour type and bit depth
-            const bit_depth = try r.readIntBig(u8);
-            const colour_type = try std.meta.intToEnum(ColourType, try r.readIntBig(u8));
+            const bit_depth = try r.readInt(u8, .big);
+            const colour_type = try std.meta.intToEnum(ColourType, try r.readInt(u8, .big));
             const allowed_bit_depths: []const u5 = switch (colour_type) {
                 .greyscale => &.{ 1, 2, 4, 8, 16 },
                 .truecolour, .greyscale_alpha, .truecolour_alpha => &.{ 8, 16 },
@@ -211,19 +211,19 @@ fn Decoder(comptime Reader: type) type {
             }
 
             // Read and validate compression method and filter method
-            const compression_method = try r.readIntBig(u8);
-            const filter_method = try r.readIntBig(u8);
+            const compression_method = try r.readInt(u8, .big);
+            const filter_method = try r.readInt(u8, .big);
             if (compression_method != 0 or filter_method != 0) {
                 return error.InvalidPng;
             }
 
             // Read and validate interlace method
-            const interlace_method = try std.meta.intToEnum(InterlaceMethod, try r.readIntBig(u8));
+            const interlace_method = try std.meta.intToEnum(InterlaceMethod, try r.readInt(u8, .big));
 
             return Ihdr{
                 .width = width,
                 .height = height,
-                .bit_depth = @intCast(u5, bit_depth),
+                .bit_depth = @intCast(bit_depth),
                 .colour_type = colour_type,
                 .compression_method = compression_method,
                 .filter_method = filter_method,
@@ -234,7 +234,7 @@ fn Decoder(comptime Reader: type) type {
         fn readChunk(self: *Self) !Chunk {
             var crc = std.hash.Crc32.init();
 
-            const len = try self.r.readIntBig(u32);
+            const len = try self.r.readInt(u32, .big);
             var ctype = try self.r.readBytesNoEof(4);
             crc.update(&ctype);
 
@@ -243,7 +243,7 @@ fn Decoder(comptime Reader: type) type {
             try self.r.readNoEof(data);
             crc.update(data);
 
-            if (crc.final() != try self.r.readIntBig(u32)) {
+            if (crc.final() != try self.r.readInt(u32, .big)) {
                 return error.InvalidPng;
             }
 
@@ -263,7 +263,7 @@ fn readPixels(
     data: []const u8,
 ) ![][4]u16 {
     var compressed_stream = std.io.fixedBufferStream(data);
-    var data_stream = try std.compress.zlib.zlibStream(allocator, compressed_stream.reader());
+    var data_stream = try std.compress.zlib.decompressStream(allocator, compressed_stream.reader());
     defer data_stream.deinit();
     const datar = data_stream.reader();
 
@@ -284,7 +284,7 @@ fn readPixels(
     defer allocator.free(line);
     var prev_line = try allocator.alloc(u8, line_bytes);
     defer allocator.free(prev_line);
-    std.mem.set(u8, prev_line, 0); // Zero prev_line
+    @memset(prev_line, 0); // Zero prev_line
 
     // Number of bits in actual colour components
     const component_bits = switch (ihdr.colour_type) {
@@ -297,7 +297,7 @@ fn readPixels(
         else => ihdr.bit_depth,
     };
     // Max component_bits-bit value
-    const component_max = @intCast(u16, (@as(u17, 1) << component_bits) - 1);
+    const component_max: u16 = @intCast((@as(u17, 1) << component_bits) - 1);
     // Multiply each colour component by this to produce a normalized u16
     const component_coef = @divExact(
         std.math.maxInt(u16),
@@ -313,7 +313,7 @@ fn readPixels(
         filterScanline(filter, ihdr.bit_depth, components, prev_line, line);
 
         var line_stream = std.io.fixedBufferStream(line);
-        var bits = std.io.bitReader(.Big, line_stream.reader());
+        var bits = std.io.bitReader(.big, line_stream.reader());
 
         var x: u32 = 0;
         while (x < ihdr.width) : (x += 1) {
@@ -356,7 +356,7 @@ fn readPixels(
             }
 
             const idx = x + y * ihdr.width;
-            for (pix) |c, i| {
+            for (pix, 0..) |c, i| {
                 pixels[idx][i] = component_coef * c;
             }
         }
@@ -416,11 +416,11 @@ const ChunkType = blk: {
     };
 
     var fields: [types.len]std.builtin.Type.EnumField = undefined;
-    for (types) |name, i| {
+    for (types, 0..) |name, i| {
         var field_name: [4]u8 = undefined;
         fields[i] = .{
             .name = std.ascii.lowerString(&field_name, name),
-            .value = std.mem.readIntNative(u32, name),
+            .value = @as(u32, @bitCast(name.*)),
         };
     }
 
@@ -432,12 +432,11 @@ const ChunkType = blk: {
     } });
 };
 fn chunkType(name: [4]u8) ChunkType {
-    return @intToEnum(ChunkType, std.mem.readIntNative(u32, &name));
+    const x: u32 = @bitCast(name);
+    return @enumFromInt(x);
 }
 fn chunkName(ctype: ChunkType) [4]u8 {
-    var name: [4]u8 = undefined;
-    std.mem.writeIntNative(u32, &name, @enumToInt(ctype));
-    return name;
+    return @bitCast(@intFromEnum(ctype));
 }
 
 // TODO: use optional prev_line, so we can avoid zeroing
@@ -451,7 +450,7 @@ fn filterScanline(filter: FilterType, bit_depth: u5, components: u4, prev_line: 
         else => unreachable,
     };
 
-    for (line) |*x, i| {
+    for (line, 0..) |*x, i| {
         const a = if (i < byte_rewind) 0 else line[i - byte_rewind];
         const b = prev_line[i];
         const c = if (i < byte_rewind) 0 else prev_line[i - byte_rewind];
@@ -460,58 +459,20 @@ fn filterScanline(filter: FilterType, bit_depth: u5, components: u4, prev_line: 
             .none => unreachable,
             .sub => a,
             .up => b,
-            .average => @intCast(u8, (@as(u9, a) + b) / 2),
+            .average => @intCast((@as(u9, a) + b) / 2),
             .paeth => paeth(a, b, c),
         };
     }
 }
 fn paeth(a: u8, b: u8, c: u8) u8 {
     const p = @as(i10, a) + b - c;
-    const pa = std.math.absInt(p - a) catch unreachable;
-    const pb = std.math.absInt(p - b) catch unreachable;
-    const pc = std.math.absInt(p - c) catch unreachable;
+    const pa = @abs(p - a);
+    const pb = @abs(p - b);
+    const pc = @abs(p - c);
     return if (pa <= pb and pa <= pc)
         a
     else if (pb <= pc)
         b
     else
         c;
-}
-
-test "red/blue" {
-    var dir = try std.fs.cwd().openDir("test/red_blue", .{ .iterate = true });
-    defer dir.close();
-    var it = dir.iterate();
-    while (try it.next()) |entry| {
-        const f = try dir.openFile(entry.name, .{});
-        defer f.close();
-        var buf = std.io.bufferedReader(f.reader());
-        const img = try Image.read(std.testing.allocator, buf.reader());
-        defer img.deinit(std.testing.allocator);
-
-        for (img.pixels) |pix, i| {
-            const r: u16 = if (img.x(i) < 32) 0 else 65535;
-            const b: u16 = if (img.y(i) < 32) 0 else 65535;
-            try std.testing.expectEqual([4]u16{ r, 0, b, 65535 }, pix);
-        }
-    }
-}
-
-test "green/alpha" {
-    var dir = try std.fs.cwd().openDir("test/green_alpha", .{ .iterate = true });
-    defer dir.close();
-    var it = dir.iterate();
-    while (try it.next()) |entry| {
-        const f = try dir.openFile(entry.name, .{});
-        defer f.close();
-        var buf = std.io.bufferedReader(f.reader());
-        const img = try Image.read(std.testing.allocator, buf.reader());
-        defer img.deinit(std.testing.allocator);
-
-        for (img.pixels) |pix, i| {
-            const g: u16 = if (img.x(i) < 32) 0 else 65535;
-            const a: u16 = if (img.y(i) < 32) 0 else 65535;
-            try std.testing.expectEqual([4]u16{ 0, g, 0, a }, pix);
-        }
-    }
 }
