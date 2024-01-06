@@ -6,6 +6,6 @@
         "build.zig",
         "build.zig.zon",
         "LICENSE",
-        "zpng.zig",
+        "src",
     },
 }
