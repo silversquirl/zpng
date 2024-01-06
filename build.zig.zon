@@ -1,6 +1,6 @@
 .{
     .name = "zpng",
-    .description = "Fast and minimal PNG parser",
+    .description = "Fast and minimal PNG encoder/decoder",
     .version = "0.1.0",
     .paths = .{
         "build.zig",

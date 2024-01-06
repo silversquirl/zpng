@@ -1,53 +1,17 @@
 const std = @import("std");
+const common = @import("common.zig");
+const zpng = @import("zpng.zig");
 
-const debug_enabled = std.meta.globalOption("zpng_debug", bool) orelse
-    (@import("builtin").mode == .Debug);
+// TODO: reduce allocations using streaming
 
-fn debug(comptime level: @TypeOf(.x), comptime format: []const u8, args: anytype) void {
-    if (debug_enabled) {
-        @field(std.log.scoped(.zpng), @tagName(level))(format, args);
-    }
-}
-
-pub const Image = struct {
-    width: u32,
-    height: u32,
-    pixels: [][4]u16,
-
-    // If the PNG is invalid or corrupt, error.InvalidPng is returned.
-    // If the PNG may be valid, but uses features not supported by this implementation, error.UnsupportedPng is returned.
-    pub fn read(allocator: std.mem.Allocator, r: anytype) !Image {
-        var dec = Decoder(@TypeOf(r)){ .allocator = allocator, .r = r };
-        return dec.decode();
-    }
-
-    pub fn deinit(self: Image, allocator: std.mem.Allocator) void {
-        allocator.free(self.pixels);
-    }
-
-    /// Return the X coordinate of the pixel at index
-    pub fn x(self: Image, index: usize) u32 {
-        return @intCast(index % self.width);
-    }
-    /// Return the Y coordinate of the pixel at index
-    pub fn y(self: Image, index: usize) u32 {
-        return @intCast(index / self.height);
-    }
-
-    /// Return the pixel at the given X and Y coordinates
-    pub fn pix(self: Image, px: u32, py: u32) [4]u16 {
-        return self.pixels[px + py * self.width];
-    }
-};
-
-fn Decoder(comptime Reader: type) type {
+pub fn Decoder(comptime Reader: type) type {
     return struct {
         allocator: std.mem.Allocator,
         r: Reader,
 
         const Self = @This();
 
-        fn decode(self: *Self) !Image {
+        pub fn decode(self: *Self) !zpng.Image {
             // Read magic bytes
             if (!try self.r.isBytes("\x89PNG\r\n\x1a\n")) {
                 return error.InvalidPng;
@@ -68,7 +32,7 @@ fn Decoder(comptime Reader: type) type {
             defer if (data) |l| l.deinit();
             var palette: ?[][4]u16 = null;
             defer if (palette) |p| self.allocator.free(p);
-            var transparent_color: ?[3]u16 = null; // Not normalized. If greyscale, only first value is used
+            var transparent_color: ?[3]u16 = null; // Not normalized. If grayscale, only first value is used
 
             while (true) {
                 const chunk = try self.readChunk();
@@ -85,7 +49,7 @@ fn Decoder(comptime Reader: type) type {
                     },
 
                     .plte => {
-                        if (ihdr.colour_type != .indexed) {
+                        if (ihdr.color_type != .indexed) {
                             return error.InvalidPng; // Unexpected PLTE
                         }
                         if (palette != null) {
@@ -115,19 +79,19 @@ fn Decoder(comptime Reader: type) type {
                     },
 
                     .trns => {
-                        switch (ihdr.colour_type) {
-                            .greyscale_alpha, .truecolour_alpha => {
+                        switch (ihdr.color_type) {
+                            .grayscale_alpha, .truecolor_alpha => {
                                 return error.InvalidPng; // tRNS invalid with alpha channel
                             },
 
-                            .greyscale => {
+                            .grayscale => {
                                 if (chunk.data.len != 2) {
                                     return error.InvalidPng; // tRNS data of incorrect length
                                 }
                                 transparent_color = .{ std.mem.readInt(u16, chunk.data[0..2], .big), 0, 0 };
                             },
 
-                            .truecolour => {
+                            .truecolor => {
                                 if (chunk.data.len != 6) {
                                     return error.InvalidPng; // tRNS data of incorrect length
                                 }
@@ -150,8 +114,8 @@ fn Decoder(comptime Reader: type) type {
                     },
 
                     _ => {
-                        const cname = chunkName(chunk.ctype);
-                        debug(.warn, "Unsupported chunk: {s}", .{cname});
+                        const cname = common.chunkName(chunk.ctype);
+                        common.debug(.warn, "Unsupported chunk: {s}", .{cname});
                         if (cname[0] & 32 == 0) {
                             // Ancillary bit is unset, this chunk is critical
                             return error.UnsupportedPng;
@@ -172,14 +136,14 @@ fn Decoder(comptime Reader: type) type {
                 data.?.items,
             );
 
-            return Image{
+            return zpng.Image{
                 .width = ihdr.width,
                 .height = ihdr.height,
                 .pixels = pixels,
             };
         }
 
-        fn readIhdr(self: *Self) !Ihdr {
+        fn readIhdr(self: *Self) !common.Ihdr {
             // Read chunk
             const chunk = try self.readChunk();
             defer self.allocator.free(chunk.data);
@@ -196,12 +160,12 @@ fn Decoder(comptime Reader: type) type {
                 return error.InvalidPng;
             }
 
-            // Read and validate colour type and bit depth
+            // Read and validate color type and bit depth
             const bit_depth = try r.readInt(u8, .big);
-            const colour_type = try std.meta.intToEnum(ColourType, try r.readInt(u8, .big));
-            const allowed_bit_depths: []const u5 = switch (colour_type) {
-                .greyscale => &.{ 1, 2, 4, 8, 16 },
-                .truecolour, .greyscale_alpha, .truecolour_alpha => &.{ 8, 16 },
+            const color_type = try std.meta.intToEnum(zpng.ColorType, try r.readInt(u8, .big));
+            const allowed_bit_depths: []const u5 = switch (color_type) {
+                .grayscale => &.{ 1, 2, 4, 8, 16 },
+                .truecolor, .grayscale_alpha, .truecolor_alpha => &.{ 8, 16 },
                 .indexed => &.{ 1, 2, 4, 8 },
             };
             for (allowed_bit_depths) |depth| {
@@ -211,27 +175,24 @@ fn Decoder(comptime Reader: type) type {
             }
 
             // Read and validate compression method and filter method
-            const compression_method = try r.readInt(u8, .big);
-            const filter_method = try r.readInt(u8, .big);
-            if (compression_method != 0 or filter_method != 0) {
-                return error.InvalidPng;
-            }
+            const compression_method = try std.meta.intToEnum(common.CompressionMethod, try r.readInt(u8, .big));
+            const filter_method = try std.meta.intToEnum(common.FilterMethod, try r.readInt(u8, .big));
 
             // Read and validate interlace method
-            const interlace_method = try std.meta.intToEnum(InterlaceMethod, try r.readInt(u8, .big));
+            const interlace_method = try std.meta.intToEnum(zpng.InterlaceMethod, try r.readInt(u8, .big));
 
-            return Ihdr{
+            return common.Ihdr{
                 .width = width,
                 .height = height,
                 .bit_depth = @intCast(bit_depth),
-                .colour_type = colour_type,
+                .color_type = color_type,
                 .compression_method = compression_method,
                 .filter_method = filter_method,
                 .interlace_method = interlace_method,
             };
         }
 
-        fn readChunk(self: *Self) !Chunk {
+        fn readChunk(self: *Self) !common.Chunk {
             var crc = std.hash.Crc32.init();
 
             const len = try self.r.readInt(u32, .big);
@@ -247,8 +208,8 @@ fn Decoder(comptime Reader: type) type {
                 return error.InvalidPng;
             }
 
-            return Chunk{
-                .ctype = chunkType(ctype),
+            return common.Chunk{
+                .ctype = common.chunkType(ctype),
                 .data = data,
             };
         }
@@ -257,9 +218,9 @@ fn Decoder(comptime Reader: type) type {
 
 fn readPixels(
     allocator: std.mem.Allocator,
-    ihdr: Ihdr,
+    ihdr: common.Ihdr,
     palette: ?[]const [4]u16,
-    transparent_color: ?[3]u16, // Not normalized. If greyscale, only first value is used
+    transparent_color: ?[3]u16, // Not normalized. If grayscale, only first value is used
     data: []const u8,
 ) ![][4]u16 {
     var compressed_stream = std.io.fixedBufferStream(data);
@@ -271,23 +232,15 @@ fn readPixels(
     var pixels = try allocator.alloc([4]u16, ihdr.width * ihdr.height);
     errdefer allocator.free(pixels);
 
-    const components: u3 = switch (ihdr.colour_type) {
-        .indexed => 1,
-        .greyscale => 1,
-        .greyscale_alpha => 2,
-        .truecolour => 3,
-        .truecolour_alpha => 4,
-    };
-    const line_bytes = (ihdr.width * ihdr.bit_depth * components - 1) / 8 + 1;
-
+    const line_bytes = ihdr.lineBytes();
     var line = try allocator.alloc(u8, line_bytes);
     defer allocator.free(line);
     var prev_line = try allocator.alloc(u8, line_bytes);
     defer allocator.free(prev_line);
     @memset(prev_line, 0); // Zero prev_line
 
-    // Number of bits in actual colour components
-    const component_bits = switch (ihdr.colour_type) {
+    // Number of bits in actual color components
+    const component_bits = switch (ihdr.color_type) {
         .indexed => blk: {
             if (palette == null) {
                 return error.InvalidPng; // Missing PLTE
@@ -298,7 +251,7 @@ fn readPixels(
     };
     // Max component_bits-bit value
     const component_max: u16 = @intCast((@as(u17, 1) << component_bits) - 1);
-    // Multiply each colour component by this to produce a normalized u16
+    // Multiply each color component by this to produce a normalized u16
     const component_coef = @divExact(
         std.math.maxInt(u16),
         component_max,
@@ -306,35 +259,35 @@ fn readPixels(
 
     var y: u32 = 0;
     while (y < ihdr.height) : (y += 1) {
-        const filter = std.meta.intToEnum(FilterType, try datar.readByte()) catch {
+        const filter = std.meta.intToEnum(common.FilterType, try datar.readByte()) catch {
             return error.InvalidPng;
         };
         try datar.readNoEof(line);
-        filterScanline(filter, ihdr.bit_depth, components, prev_line, line);
+        filterScanline(filter, ihdr.bit_depth, common.components(ihdr.color_type), prev_line, line);
 
         var line_stream = std.io.fixedBufferStream(line);
         var bits = std.io.bitReader(.big, line_stream.reader());
 
         var x: u32 = 0;
         while (x < ihdr.width) : (x += 1) {
-            var pix: [4]u16 = switch (ihdr.colour_type) {
-                .greyscale => blk: {
+            var pix: [4]u16 = switch (ihdr.color_type) {
+                .grayscale => blk: {
                     const v = try bits.readBitsNoEof(u16, ihdr.bit_depth);
                     break :blk .{ v, v, v, component_max };
                 },
-                .greyscale_alpha => blk: {
+                .grayscale_alpha => blk: {
                     const v = try bits.readBitsNoEof(u16, ihdr.bit_depth);
                     const a = try bits.readBitsNoEof(u16, ihdr.bit_depth);
                     break :blk .{ v, v, v, a };
                 },
 
-                .truecolour => .{
+                .truecolor => .{
                     try bits.readBitsNoEof(u16, ihdr.bit_depth),
                     try bits.readBitsNoEof(u16, ihdr.bit_depth),
                     try bits.readBitsNoEof(u16, ihdr.bit_depth),
                     component_max,
                 },
-                .truecolour_alpha => .{
+                .truecolor_alpha => .{
                     try bits.readBitsNoEof(u16, ihdr.bit_depth),
                     try bits.readBitsNoEof(u16, ihdr.bit_depth),
                     try bits.readBitsNoEof(u16, ihdr.bit_depth),
@@ -345,9 +298,9 @@ fn readPixels(
             };
 
             if (transparent_color) |trns| {
-                const n: u2 = switch (ihdr.colour_type) {
-                    .greyscale => 1,
-                    .truecolour => 3,
+                const n: u2 = switch (ihdr.color_type) {
+                    .grayscale => 1,
+                    .truecolor => 3,
                     else => unreachable,
                 };
                 if (std.mem.eql(u16, pix[0..n], &trns)) {
@@ -374,73 +327,8 @@ fn readPixels(
     return pixels;
 }
 
-const Ihdr = struct {
-    width: u32,
-    height: u32,
-    bit_depth: u5,
-    colour_type: ColourType,
-    compression_method: u8,
-    filter_method: u8,
-    interlace_method: InterlaceMethod,
-};
-const ColourType = enum(u8) {
-    greyscale = 0,
-    truecolour = 2,
-    indexed = 3,
-    greyscale_alpha = 4,
-    truecolour_alpha = 6,
-};
-const InterlaceMethod = enum(u8) {
-    none = 0,
-    adam7 = 1,
-};
-const FilterType = enum(u8) {
-    none = 0,
-    sub = 1,
-    up = 2,
-    average = 3,
-    paeth = 4,
-};
-
-const Chunk = struct {
-    ctype: ChunkType,
-    data: []u8,
-};
-const ChunkType = blk: {
-    const types = [_]*const [4]u8{
-        "IHDR",
-        "PLTE",
-        "IDAT",
-        "IEND",
-        "tRNS",
-    };
-
-    var fields: [types.len]std.builtin.Type.EnumField = undefined;
-    for (types, 0..) |name, i| {
-        var field_name: [4]u8 = undefined;
-        fields[i] = .{
-            .name = std.ascii.lowerString(&field_name, name),
-            .value = @as(u32, @bitCast(name.*)),
-        };
-    }
-
-    break :blk @Type(.{ .Enum = .{
-        .tag_type = u32,
-        .fields = &fields,
-        .decls = &.{},
-        .is_exhaustive = false,
-    } });
-};
-fn chunkType(name: [4]u8) ChunkType {
-    const x: u32 = @bitCast(name);
-    return @enumFromInt(x);
-}
-fn chunkName(ctype: ChunkType) [4]u8 {
-    return @bitCast(@intFromEnum(ctype));
-}
-
 // TODO: use optional prev_line, so we can avoid zeroing
-fn filterScanline(filter: FilterType, bit_depth: u5, components: u4, prev_line: []const u8, line: []u8) void {
+fn filterScanline(filter: common.FilterType, bit_depth: u5, components: u4, prev_line: []const u8, line: []u8) void {
     if (filter == .none) return;
 
     const byte_rewind = switch (bit_depth) {
