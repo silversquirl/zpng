@@ -106,8 +106,11 @@ pub fn Decoder(comptime Reader: type) type {
                                 const plte = palette orelse {
                                     return error.InvalidPng; // tRNS before PLTE
                                 };
-                                for (chunk.data, 0..) |trns, i| {
-                                    plte[i][3] = trns;
+                                if (chunk.data.len > plte.len) {
+                                    return error.InvalidPng; // more tRNS than PLTE entries
+                                }
+                                for (plte[0..chunk.data.len], chunk.data) |*color, alpha| {
+                                    color[3] = alpha;
                                 }
                             },
                         }

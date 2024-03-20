@@ -82,6 +82,24 @@ test "encode random noise" {
     try testRoundtrip(img, .{});
 }
 
+test "decoder crashes found by fuzzing" {
+    var dir = try std.fs.cwd().openDir("fuzz/crashes", .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        const f = try dir.openFile(entry.name, .{});
+        defer f.close();
+        var buf = std.io.bufferedReader(f.reader());
+
+        const img = zpng.Image.read(std.testing.allocator, buf.reader()) catch {
+            // Errors are expected from fuzz cases (but not required, so we continue either way)
+            continue;
+        };
+        defer img.deinit(std.testing.allocator);
+        std.mem.doNotOptimizeAway(img);
+    }
+}
+
 fn testRoundtrip(img: zpng.Image, opts: zpng.EncodeOptions) !void {
     // Encode image
     var array = std.ArrayList(u8).init(std.testing.allocator);
