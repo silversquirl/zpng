@@ -1,8 +1,10 @@
 const std = @import("std");
 const zpng = @import("zpng.zig");
 
-const debug_enabled = std.meta.globalOption("zpng_debug", bool) orelse
-    (@import("builtin").mode == .Debug);
+const debug_enabled = if (@hasField(@import("root"), "zpng_debug"))
+    @import("root").zpng_debug
+else
+    @import("builtin").mode == .Debug;
 
 pub fn debug(comptime level: @TypeOf(.x), comptime format: []const u8, args: anytype) void {
     if (debug_enabled) {
@@ -68,9 +70,11 @@ pub const ChunkType = blk: {
 
     var fields: [types.len]std.builtin.Type.EnumField = undefined;
     for (types, 0..) |name, i| {
-        var field_name: [4]u8 = undefined;
+        var field_name_buf: [4:0]u8 = undefined;
+        const field_name = std.ascii.lowerString(&field_name_buf, name);
+        field_name_buf[field_name.len] = 0;
         fields[i] = .{
-            .name = std.ascii.lowerString(&field_name, name),
+            .name = field_name[0.. :0],
             .value = @as(u32, @bitCast(name.*)),
         };
     }

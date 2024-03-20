@@ -36,8 +36,7 @@ pub fn Encoder(comptime Writer: type) type {
             defer data.deinit();
             {
                 // TODO: add option for compression level
-                var compressor = try std.compress.zlib.compressStream(self.allocator, data.writer(), .{});
-                defer compressor.deinit();
+                var compressor = try std.compress.zlib.compressor(data.writer(), .{});
                 try writePixels(self.allocator, ihdr, img.pixels, compressor.writer());
                 try compressor.finish();
             }

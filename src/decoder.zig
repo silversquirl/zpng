@@ -224,8 +224,7 @@ fn readPixels(
     data: []const u8,
 ) ![][4]u16 {
     var compressed_stream = std.io.fixedBufferStream(data);
-    var data_stream = try std.compress.zlib.decompressStream(allocator, compressed_stream.reader());
-    defer data_stream.deinit();
+    var data_stream = std.compress.zlib.decompressor(compressed_stream.reader());
     const datar = data_stream.reader();
 
     // TODO: interlacing
